@@ -1,8 +1,8 @@
-IN: nrbf;
+IN: nrbf
 
 USING: accessors alien.c-types alien.enums alien.syntax arrays assocs calendar
-combinators endian io io.encodings io.encodings.binary io.encodings.utf8
-io.files kernel make math math.bitwise pack sequences ;
+combinators endian io io.encodings io.encodings.utf8 kernel make math
+math.bitwise namespaces pack sequences ;
 
 ! MS-NRBF Reader
 DEFER: read-record
@@ -254,5 +254,94 @@ ERROR: unsupported-record-type-enum type ;
     record-type read-enum [ record-type>class new read-new-record ] [ f ] if* ;
 
 ! Unstructured sequence of records
-: read-nrbf-records ( path -- records )
-    binary [ [ [ read-record dup [ , ] when* ] loop ] V{ } make ] with-file-reader >array ;
+! NOTE: expect binary stream!
+: read-nrbf-records ( -- records )
+    [ [ read-record dup [ , ] when* ] loop ] V{ } make >array ;
+
+! * Convert to Factor objects
+! two-pass:
+! first: collect all references in hashtable
+! second: rebuild object graph from root id
+
+! ** Wrapper, could be used to fill an actual tuple class
+TUPLE: nrbf-class-instance
+    name
+    fields ;
+
+! two-pass:
+! first: collect all references in hashtable
+! second: rebuild object graph from root id
+
+SYMBOL: object-index
+SYMBOL: library-index
+SYMBOL: root-id
+
+! ** Indexing
+
+GENERIC: index-object ( thing -- )
+M: sequence index-object [ index-object ] each ;
+
+M: class-record index-object
+    [ dup class-info>> object-id>> object-index get set-at ]
+    [ members>> index-object ] bi ;
+
+ERROR: duplicate-root-id object id ;
+M: serialization-header-record index-object
+    root-id get [ duplicate-root-id ] when*
+    root-id>> root-id set ;
+
+M: binary-library index-object
+    dup library-id>> library-index get set-at ;
+
+M: binary-object-string index-object
+    dup object-id>> object-index get set-at ;
+
+UNION: nrbf-primitive fixnum math:float timestamp ;
+
+! (converted) primitive members
+
+M: nrbf-primitive index-object drop ;
+
+! This is the thing that will be used during rebuild
+M: member-reference index-object drop ;
+
+M: array-record index-object
+    [ dup array-info>> object-id>> object-index get set-at ]
+    [ members>> index-object ] bi ;
+
+M: message-end index-object drop ;
+
+! ** Rebuilding
+
+GENERIC: convert-object ( nrbf-thing -- factor-thing )
+
+: build-object ( id -- obj )
+    object-index get [ convert-object dup ] change-at ;
+
+M: nrbf-primitive convert-object ;
+
+M: binary-object-string convert-object value>> ;
+
+M: member-reference convert-object
+    id-ref>> build-object ;
+
+M: class-record convert-object
+    [ class-info>> [ name>> ] [ member-names>> ] bi ]
+    [ members>> [ convert-object ] map ] bi
+    zip
+    nrbf-class-instance boa ;
+
+M: array-single-primitive convert-object
+    [ members>> ]
+    [ primitive-type-enum>> ] bi
+    Byte? [ >byte-array ] [ >array ] if ;
+
+! * High-level entry point
+: read-nrbf-message ( -- object )
+    read-nrbf-records
+    [
+        H{ } clone object-index set
+        H{ } clone library-index set
+        index-object
+        root-id get build-object
+    ] with-scope ;
