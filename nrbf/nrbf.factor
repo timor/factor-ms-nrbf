@@ -13,7 +13,8 @@ DEFER: read-record
 
 ! read a ULEB128 encoded number
 : read-uleb128 ( -- n )
-    0 [ read1 [ 6 0 bit-range + ] [ 7 bit? ] bi ] [ 7 shift ] do while ; 
+    ! shift acc new-7bits new-msb
+    0 0 [ read1 [ 6 0 bit-range pick shift bitor [ 7 + ] dip ] [ 7 bit? ] bi ] loop nip ;
 
 ! read length-prefixed-string
 : read-lpstring ( -- str )
