@@ -20,6 +20,8 @@ DEFER: read-record
 : read-lpstring ( -- str )
     read-uleb128 utf8 [ read ] with-decoded-input ;
 
+! * Enums
+
 ENUM: binary-type < uchar
     { Primitive 0 }
     { String 1 }
@@ -73,8 +75,19 @@ ENUM: record-type < uchar
     { MethodReturn 22 }
     ;
 
+ENUM: binary-array-type < uchar
+    { Single-Array 0 }
+    { Jagged 1 }
+    { Rectangular 2 }
+    { SingleOffset 3 }
+    { JaggedOffset 4 }
+    { RectangularOffset 5 }
+    ;
+
 : read-enum ( enum-class -- value )
     read1 swap number>enum ; inline
+
+! * Decoding Primitive Values
 
 ! Reading Encoded Values
 ERROR: unsupported-primitive-member enum ;
@@ -119,6 +132,30 @@ TUPLE: binary-library
 M: binary-library read-new-record
     read-int32 >>library-id
     read-lpstring >>library-name ;
+
+! ** Other Records
+TUPLE: object-null ;
+M: object-null read-new-record ;
+
+TUPLE: binary-object-string
+    object-id
+    value ;
+
+M: binary-object-string read-new-record
+    read-int32 >>object-id
+    read-lpstring >>value ;
+
+TUPLE: member-reference
+    id-ref ;
+
+M: member-reference read-new-record
+    read-int32 >>id-ref ;
+
+TUPLE: message-end ;
+M: message-end read-new-record ;
+
+
+! ** Class Records
 
 TUPLE: class-info
     object-id
@@ -193,6 +230,8 @@ M: class-with-members-and-types read-new-record
     read-int32 >>library-id
     read-class-record-members ;
 
+! ** Arrays
+
 TUPLE: array-info
     object-id
     length ;
@@ -218,25 +257,45 @@ M: array-single-primitive read-new-record
     dup [ array-info>> length>> ] [ primitive-type-enum>> ] bi
     '[ _ read-primitive-member ] replicate >>members ;
 
-
-TUPLE: binary-object-string
+TUPLE: binary-array
     object-id
-    value ;
+    binary-array-type-enum
+    rank
+    lengths
+    lower-bounds
+    type-enum
+    additional-type-info
+    members
+    ;
 
-M: binary-object-string read-new-record
+UNION: offset-binary-array-type SingleOffset JaggedOffset RectangularOffset ;
+
+GENERIC: read-array-member* ( n record -- m )
+
+UNION: simple-array-member member-reference ;
+M: simple-array-member read-array-member*
+    , 1 - ;
+
+: read-array-member ( n -- m )
+    read-record read-array-member* ;
+
+: read-array-members ( n -- array )
+    [ [ dup 0 > ] [ read-array-member ] while drop ] V{ } make >array ;
+
+
+M: binary-array read-new-record
     read-int32 >>object-id
-    read-lpstring >>value ;
+    binary-array-type read-enum >>binary-array-type-enum
+    read-int32 >>rank
+    dup rank>> [ read-int32 ] replicate >>lengths
+    dup binary-array-type-enum>> offset-binary-array-type?
+    [ dup rank>> [ read-int32 ] replicate >>lower-bounds ] when
+    binary-type read-enum >>type-enum
+    dup type-enum>> read-additional-info >>additional-type-info
+    dup lengths>> product read-array-members >>members ;
 
-TUPLE: member-reference
-    id-ref ;
 
-M: member-reference read-new-record
-    read-int32 >>id-ref ;
-
-TUPLE: message-end ;
-M: message-end read-new-record ;
-
-! Main record dispatch
+! * Main record dispatch
 
 ERROR: unsupported-record-type-enum type ;
 
@@ -244,8 +303,10 @@ ERROR: unsupported-record-type-enum type ;
     H{
         { SerializedStreamHeader serialization-header-record }
         { BinaryObjectString binary-object-string }
+        { BinaryArray binary-array }
         { ClassWithMembersAndTypes class-with-members-and-types }
         { MemberReference member-reference }
+        { ObjectNull object-null }
         { MessageEnd message-end }
         { BinaryLibrary binary-library }
         { ArraySinglePrimitive array-single-primitive }
