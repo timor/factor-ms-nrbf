@@ -295,31 +295,6 @@ M: binary-array read-new-record
     dup lengths>> product read-array-members >>members ;
 
 
-! * Main record dispatch
-
-ERROR: unsupported-record-type-enum type ;
-
-: record-type>class ( type -- class )
-    H{
-        { SerializedStreamHeader serialization-header-record }
-        { BinaryObjectString binary-object-string }
-        { BinaryArray binary-array }
-        { ClassWithMembersAndTypes class-with-members-and-types }
-        { MemberReference member-reference }
-        { ObjectNull object-null }
-        { MessageEnd message-end }
-        { BinaryLibrary binary-library }
-        { ArraySinglePrimitive array-single-primitive }
-    } ?at [ unsupported-record-type-enum ] unless ;
-
-: read-record ( -- record/f )
-    record-type read-enum [ record-type>class new read-new-record ] [ f ] if* ;
-
-! Unstructured sequence of records
-! NOTE: expect binary stream!
-: read-nrbf-records ( -- records )
-    [ [ read-record dup [ , ] when* ] loop ] V{ } make >array ;
-
 ! * Convert to Factor objects
 ! two-pass:
 ! first: collect all references in hashtable
@@ -334,17 +309,35 @@ TUPLE: nrbf-class-instance
 ! first: collect all references in hashtable
 ! second: rebuild object graph from root id
 
+! ** (De-)Serialization Context
 SYMBOL: object-index
 SYMBOL: library-index
 SYMBOL: root-id
+
+: with-nrbf-context ( quot -- )
+    '[
+        H{ } clone object-index set
+        H{ } clone library-index set
+        @
+    ] with-scope ; inline
+
 
 ! ** Indexing
 
 GENERIC: index-object ( thing -- )
 M: sequence index-object [ index-object ] each ;
 
+! (converted) primitive members
+UNION: nrbf-primitive fixnum math:float timestamp ;
+UNION: nrbf-leaf nrbf-primitive object-null member-reference message-end ;
+
+M: nrbf-leaf index-object drop ;
+
+: register-object ( obj index -- )
+    object-index get set-at ;
+
 M: class-record index-object
-    [ dup class-info>> object-id>> object-index get set-at ]
+    [ dup class-info>> object-id>> register-object ]
     [ members>> index-object ] bi ;
 
 ERROR: duplicate-root-id object id ;
@@ -356,22 +349,15 @@ M: binary-library index-object
     dup library-id>> library-index get set-at ;
 
 M: binary-object-string index-object
-    dup object-id>> object-index get set-at ;
-
-UNION: nrbf-primitive fixnum math:float timestamp ;
-
-! (converted) primitive members
-
-M: nrbf-primitive index-object drop ;
-
-! This is the thing that will be used during rebuild
-M: member-reference index-object drop ;
+    dup object-id>> register-object ;
 
 M: array-record index-object
-    [ dup array-info>> object-id>> object-index get set-at ]
+    [ dup array-info>> object-id>> register-object ]
     [ members>> index-object ] bi ;
 
-M: message-end index-object drop ;
+M: binary-array index-object
+    [ dup object-id>> register-object ]
+    [ members>> index-object ] bi ;
 
 ! ** Rebuilding
 
@@ -398,12 +384,36 @@ M: array-single-primitive convert-object
     [ primitive-type-enum>> ] bi
     Byte? [ >byte-array ] [ >array ] if ;
 
-! * High-level entry point
+! * High-level entry points
+
+! ** Main record dispatch
+
+ERROR: unsupported-record-type-enum type ;
+
+: record-type>class ( type -- class )
+    H{
+        { SerializedStreamHeader serialization-header-record }
+        { BinaryObjectString binary-object-string }
+        { BinaryArray binary-array }
+        { ClassWithMembersAndTypes class-with-members-and-types }
+        { MemberReference member-reference }
+        { ObjectNull object-null }
+        { MessageEnd message-end }
+        { BinaryLibrary binary-library }
+        { ArraySinglePrimitive array-single-primitive }
+    } ?at [ unsupported-record-type-enum ] unless ;
+
+: read-record ( -- record/f )
+    record-type read-enum [ record-type>class new read-new-record ] [ f ] if* ;
+
+! Unstructured sequence of records
+! NOTE: expect binary stream!
+: read-nrbf-records ( -- )
+    ! [ [ read-record dup [ [ index-object ] [ , ] bi ] when* ] loop ] V{ } make >array ;
+    [ read-record dup [ index-object ] when* ] loop ;
+
 : read-nrbf-message ( -- object )
-    read-nrbf-records
     [
-        H{ } clone object-index set
-        H{ } clone library-index set
-        index-object
+        read-nrbf-records
         root-id get build-object
-    ] with-scope ;
+    ] with-nrbf-context ;
