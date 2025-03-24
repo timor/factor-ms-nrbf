@@ -1,8 +1,32 @@
 IN: nrbf
 
-USING: accessors alien.c-types alien.enums alien.syntax arrays assocs calendar
-combinators endian io io.encodings io.encodings.utf8 kernel make math
-math.bitwise namespaces pack sequences ;
+USING: accessors alien.c-types alien.enums alien.syntax arrays assocs
+byte-arrays calendar combinators endian io io.encodings io.encodings.utf8 kernel
+make math math.bitwise namespaces pack sequences ;
+
+! ** (De-)Serialization Context
+SYMBOL: object-index
+SYMBOL: library-index
+SYMBOL: root-id
+! Cache used during rebuilding
+SYMBOL: built-objects
+
+ERROR: unknown-object-id id ;
+
+: lookup-object-id ( id -- thing )
+    object-index get ?at [ unknown-object-id ] unless ;
+
+: register-object ( obj index -- )
+    object-index get set-at ;
+
+: with-nrbf-context ( quot -- )
+    '[
+        H{ } clone object-index set
+        H{ } clone library-index set
+        H{ } clone built-objects set
+        @
+    ] with-scope ; inline
+
 
 ! MS-NRBF Reader
 DEFER: read-record
@@ -66,7 +90,7 @@ ENUM: record-type < uchar
     { ObjectNull 10 }
     { MessageEnd 11 }
     { BinaryLibrary 12 }
-    { ObjectMultiple256 13 }
+    { ObjectNullMultiple256 13 }
     { ObjectNullMultiple 14 }
     { ArraySinglePrimitive 15 }
     { ArraySingleObject 16 }
@@ -106,6 +130,9 @@ M: Int32 read-primitive-member drop 4 read signed-le> ;
 M: Single read-primitive-member drop 4 read le> bits>float ;
 M: DateTime read-primitive-member drop 8 read le> DateTime>timestamp ;
 M: Byte read-primitive-member drop read1 ;
+M: Boolean read-primitive-member drop read1 1 = ;
+M: UInt16 read-primitive-member drop 2 read le> ;
+M: UInt32 read-primitive-member drop 4 read le> ;
 
 
 ! Fill a newly created record with data
@@ -136,6 +163,18 @@ M: binary-library read-new-record
 ! ** Other Records
 TUPLE: object-null ;
 M: object-null read-new-record ;
+
+TUPLE: object-null-multiple-256
+    null-count ;
+
+M: object-null-multiple-256 read-new-record
+    read1 >>null-count ;
+
+TUPLE: object-null-multiple
+    null-count ;
+
+M: object-null-multiple read-new-record
+    read-int32 >>null-count ;
 
 TUPLE: binary-object-string
     object-id
@@ -207,8 +246,7 @@ TUPLE: class-record
     members
     ;
 
-: read-members ( class-record -- members )
-    member-type-info>>
+: read-members ( member-type-info -- members )
     [ additional-infos>> ] [ binary-type-enums>> ] bi
     [ Primitive? [ read-primitive-member ]
       [ drop read-record ] if ]
@@ -219,8 +257,8 @@ M: class-record read-new-record
     member-count>> read-member-type-info
     >>member-type-info ;
 
-: read-class-record-members ( class-record -- class-record )
-    dup read-members >>members ;
+: read-class-record-members ( class-record -- members )
+    member-type-info>> read-members ;
 
 TUPLE: class-with-members-and-types < class-record
    library-id ;
@@ -228,9 +266,41 @@ TUPLE: class-with-members-and-types < class-record
 M: class-with-members-and-types read-new-record
     call-next-method
     read-int32 >>library-id
-    read-class-record-members ;
+    dup read-class-record-members >>members ;
+
+TUPLE: system-class-with-members-and-types < class-record ;
+M: system-class-with-members-and-types read-new-record
+    call-next-method
+    dup read-class-record-members >>members ;
+
+TUPLE: class-with-id
+    object-id
+    metadata-id
+    members ;
+
+M: class-with-id read-new-record
+    read-int32 >>object-id
+    read-int32 [ >>metadata-id ] keep
+    lookup-object-id
+    read-class-record-members >>members ;
 
 ! ** Arrays
+
+GENERIC: read-array-member* ( n record -- m )
+
+M: object read-array-member*
+    , 1 - ;
+M: object-null-multiple-256 read-array-member*
+    null-count>> [ - ] [ [ f , ] times ] bi ;
+
+M: object-null-multiple read-array-member*
+    null-count>> [ - ] [ [ f , ] times ] bi ;
+
+: read-array-member ( n -- m )
+    read-record read-array-member* ;
+
+: read-array-members ( n -- array )
+    [ [ dup 0 > ] [ read-array-member ] while drop ] V{ } make >array ;
 
 TUPLE: array-info
     object-id
@@ -257,6 +327,14 @@ M: array-single-primitive read-new-record
     dup [ array-info>> length>> ] [ primitive-type-enum>> ] bi
     '[ _ read-primitive-member ] replicate >>members ;
 
+TUPLE: array-single-string < array-record ;
+
+M: array-single-string read-new-record
+    call-next-method
+    ! NOTE: members are string records?
+    dup array-info>> length>>
+    read-array-members >>members ;
+
 TUPLE: binary-array
     object-id
     binary-array-type-enum
@@ -269,19 +347,6 @@ TUPLE: binary-array
     ;
 
 UNION: offset-binary-array-type SingleOffset JaggedOffset RectangularOffset ;
-
-GENERIC: read-array-member* ( n record -- m )
-
-UNION: simple-array-member member-reference ;
-M: simple-array-member read-array-member*
-    , 1 - ;
-
-: read-array-member ( n -- m )
-    read-record read-array-member* ;
-
-: read-array-members ( n -- array )
-    [ [ dup 0 > ] [ read-array-member ] while drop ] V{ } make >array ;
-
 
 M: binary-array read-new-record
     read-int32 >>object-id
@@ -309,62 +374,39 @@ TUPLE: nrbf-class-instance
 ! first: collect all references in hashtable
 ! second: rebuild object graph from root id
 
-! ** (De-)Serialization Context
-SYMBOL: object-index
-SYMBOL: library-index
-SYMBOL: root-id
-
-: with-nrbf-context ( quot -- )
-    '[
-        H{ } clone object-index set
-        H{ } clone library-index set
-        @
-    ] with-scope ; inline
-
-
 ! ** Indexing
+UNION: nrbf-primitive fixnum math:float timestamp POSTPONE: f t ;
 
-GENERIC: index-object ( thing -- )
-M: sequence index-object [ index-object ] each ;
+GENERIC: index-record ( thing -- )
 
-! (converted) primitive members
-UNION: nrbf-primitive fixnum math:float timestamp ;
-UNION: nrbf-leaf nrbf-primitive object-null member-reference message-end ;
+! These have direct object-id fields
+UNION: direct-object-record binary-object-string binary-array class-with-id ;
 
-M: nrbf-leaf index-object drop ;
-
-: register-object ( obj index -- )
-    object-index get set-at ;
-
-M: class-record index-object
-    [ dup class-info>> object-id>> register-object ]
-    [ members>> index-object ] bi ;
-
-ERROR: duplicate-root-id object id ;
-M: serialization-header-record index-object
-    root-id get [ duplicate-root-id ] when*
+M: serialization-header-record index-record
     root-id>> root-id set ;
 
-M: binary-library index-object
+M: binary-library index-record
     dup library-id>> library-index get set-at ;
 
-M: binary-object-string index-object
+M: direct-object-record index-record
     dup object-id>> register-object ;
 
-M: array-record index-object
-    [ dup array-info>> object-id>> register-object ]
-    [ members>> index-object ] bi ;
+M: class-record index-record
+    dup class-info>> object-id>> register-object ;
 
-M: binary-array index-object
-    [ dup object-id>> register-object ]
-    [ members>> index-object ] bi ;
+M: array-record index-record
+    dup array-info>> object-id>> register-object ;
+
+UNION: non-index-record member-reference message-end object-null object-null-multiple-256 ;
+M: non-index-record index-record drop ;
 
 ! ** Rebuilding
 
 GENERIC: convert-object ( nrbf-thing -- factor-thing )
 
 : build-object ( id -- obj )
-    object-index get [ convert-object dup ] change-at ;
+    ! object-index get [ convert-object dup ] change-at ;
+    built-objects get [ lookup-object-id convert-object ] cache ;
 
 M: nrbf-primitive convert-object ;
 
@@ -373,16 +415,36 @@ M: binary-object-string convert-object value>> ;
 M: member-reference convert-object
     id-ref>> build-object ;
 
+M: object-null convert-object drop f ;
+
+: convert-members-with-info ( class-info members -- nrbf-class-instance )
+    [ [ name>> ] [ member-names>> ] bi ] dip
+    [ convert-object ] map
+    zip nrbf-class-instance boa ;
+
 M: class-record convert-object
-    [ class-info>> [ name>> ] [ member-names>> ] bi ]
-    [ members>> [ convert-object ] map ] bi
-    zip
-    nrbf-class-instance boa ;
+    [ class-info>> ] [ members>> ] bi
+    convert-members-with-info ;
+
+M: class-with-id convert-object
+    [ metadata-id>> lookup-object-id class-info>> ]
+    [ members>> ] bi
+    convert-members-with-info ;
 
 M: array-single-primitive convert-object
     [ members>> ]
     [ primitive-type-enum>> ] bi
     Byte? [ >byte-array ] [ >array ] if ;
+
+M: array-single-string convert-object
+    members>> [ convert-object ] { } map-as ;
+
+
+ERROR: multi-dimensional-implementation-needed record ;
+M: binary-array convert-object
+    dup rank>> 1 > [ multi-dimensional-implementation-needed ] when
+    members>> [ convert-object ] { } map-as ;
+
 
 ! * High-level entry points
 
@@ -393,24 +455,30 @@ ERROR: unsupported-record-type-enum type ;
 : record-type>class ( type -- class )
     H{
         { SerializedStreamHeader serialization-header-record }
+        { ClassWithId class-with-id }
+        { SystemClassWithMembersAndTypes system-class-with-members-and-types }
         { BinaryObjectString binary-object-string }
         { BinaryArray binary-array }
         { ClassWithMembersAndTypes class-with-members-and-types }
         { MemberReference member-reference }
         { ObjectNull object-null }
+        { ObjectNullMultiple256 object-null-multiple-256 }
         { MessageEnd message-end }
         { BinaryLibrary binary-library }
         { ArraySinglePrimitive array-single-primitive }
+        { ArraySingleString array-single-string }
     } ?at [ unsupported-record-type-enum ] unless ;
 
 : read-record ( -- record/f )
-    record-type read-enum [ record-type>class new read-new-record ] [ f ] if* ;
+    record-type read-enum [
+        record-type>class new read-new-record
+        dup index-record
+    ] [ f ] if* ;
 
 ! Unstructured sequence of records
 ! NOTE: expect binary stream!
 : read-nrbf-records ( -- )
-    ! [ [ read-record dup [ [ index-object ] [ , ] bi ] when* ] loop ] V{ } make >array ;
-    [ read-record dup [ index-object ] when* ] loop ;
+    [ read-record ] loop ;
 
 : read-nrbf-message ( -- object )
     [
